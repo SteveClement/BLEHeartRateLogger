@@ -25,6 +25,9 @@ import sqlite3
 import pexpect
 import argparse
 import configparser
+from binascii import hexlify, unhexlify
+
+from gatttCharacteristics import *
 
 logging.basicConfig(format="%(asctime)-15s  %(message)s")
 log = logging.getLogger("BLEHeartRateLogger")
@@ -41,6 +44,7 @@ def parse_args():
     parser.add_argument("-o", metavar='FILE', type=str, help="Output filename of the database (default: none)")
     parser.add_argument("-H", metavar='HR_HANDLE', type=str, help="Gatttool handle used for HR notifications (default: none)")
     parser.add_argument("-v", action='store_true', help="Verbose output")
+    parser.add_argument("-r", action='store_true', help="Verbose HR even if SQL log")
     parser.add_argument("-d", action='store_true', help="Enable debug of gatttool")
 
     confpath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "BLEHeartRateLogger.conf")
@@ -54,7 +58,7 @@ def parse_args():
         # configuration of the parser.
         args = vars(parser.parse_args([]))
         err = False
-        for key in config.iterkeys():
+        for key in config.keys():
             if key not in args:
                 log.error("Configuration file error: invalid key '" + key + "'.")
                 err = True
@@ -149,7 +153,7 @@ def get_ble_hr_mac():
     Scans BLE devices and returs the address of the first device found.
     """
 
-    while 1:
+    while True:
         log.info("Trying to find a BLE device")
         hci = pexpect.spawn("hcitool lescan")
         try:
@@ -169,10 +173,10 @@ def get_ble_hr_mac():
 
     # We wait for the 'hcitool lescan' to finish
     time.sleep(1)
-    return addr
+    return addr.decode("utf-8")
 
 
-def main(addr=None, sqlfile=None, gatttool="gatttool", check_battery=False, hr_handle=None, debug_gatttool=False):
+def main(addr=None, sqlfile=None, gatttool="gatttool", check_battery=False, hr_handle=None, debug_gatttool=False, hr_show=False, verbose=False):
     """
     main routine to which orchestrates everything
     """
@@ -195,7 +199,7 @@ def main(addr=None, sqlfile=None, gatttool="gatttool", check_battery=False, hr_h
     retry = True
     while retry:
 
-        while 1:
+        while True:
             log.info("Establishing connection to " + addr)
             gt = pexpect.spawn(gatttool + " -b " + addr + " -t random --interactive")
             if debug_gatttool:
@@ -224,8 +228,28 @@ def main(addr=None, sqlfile=None, gatttool="gatttool", check_battery=False, hr_h
 
         log.info("Connected to " + addr)
 
+        if verbose:
+            gt.sendline(f"char-read-uuid {gatttChar['manufacturer']}")
+            try:
+                gt.expect("value: ([0-9a-f]+)")
+                manufacturer = gt.match.group(1)
+                log.info("Manufacturer: " + unhexlify(manufacturer).decode("utf-8"))
+
+            except pexpect.TIMEOUT:
+                log.error("Couldn't read manufacturer.")
+
+        if verbose:
+            gt.sendline(f"char-read-uuid {gatttChar['deviceName']}")
+            try:
+                gt.expect("value: ([0-9a-f]+)")
+                deviceName = gt.match.group(1)
+                log.info("Device name: " + unhexlify(deviceName).decode("utf-8"))
+
+            except pexpect.TIMEOUT:
+                log.error("Couldn't read device name.")
+
         if check_battery:
-            gt.sendline("char-read-uuid 00002a19-0000-1000-8000-00805f9b34fb")
+            gt.sendline(f"char-read-uuid {gatttChar['battery']}")
             try:
                 gt.expect("value: ([0-9a-f]+)")
                 battery_level = gt.match.group(1)
@@ -239,9 +263,9 @@ def main(addr=None, sqlfile=None, gatttool="gatttool", check_battery=False, hr_h
             # measurement characteristic.
             gt.sendline("char-desc")
 
-            while 1:
+            while True:
                 try:
-                    gt.expect(r"handle: (0x[0-9a-f]+), uuid: ([0-9a-f]{8})", timeout=10)
+                    gt.expect(r"handle: (0x[0-9a-f]+), uuid: ([0-9a-f]{8})", timeout=60)
                 except pexpect.TIMEOUT:
                     break
                 handle = gt.match.group(1).decode()
@@ -267,14 +291,14 @@ def main(addr=None, sqlfile=None, gatttool="gatttool", check_battery=False, hr_h
         last_measure = time.time() - period
         hr_expect = "Notification handle = " + hr_handle + " value: ([0-9a-f ]+)"
 
-        while 1:
+        while True:
             try:
                 gt.expect(hr_expect, timeout=10)
 
             except pexpect.TIMEOUT:
                 # If the timer expires, it means that we have lost the
                 # connection with the HR monitor
-                log.warn("Connection lost with " + addr + ". Reconnecting.")
+                log.warning("Connection lost with " + addr + ". Reconnecting.")
                 if sqlfile is not None:
                     sq.commit()
                 gt.sendline("quit")
@@ -299,12 +323,12 @@ def main(addr=None, sqlfile=None, gatttool="gatttool", check_battery=False, hr_h
 
             # Get data from gatttool
             datahex = gt.match.group(1).strip()
-            data = map(lambda x: int(x, 16), datahex.split(b' '))
+            data = [int(x, 16) for x in datahex.split(b' ')]
             res = interpret(list(data))
 
             log.debug(res)
 
-            if sqlfile is None:
+            if sqlfile is None or hr_show:
                 log.info("Heart rate: " + str(res["hr"]))
                 continue
 
@@ -340,7 +364,7 @@ def cli():
     else:
         log.setLevel(logging.INFO)
 
-    main(args.m, args.o, args.g, args.b, args.H, args.d)
+    main(addr=args.m, sqlfile=args.o, gatttool=args.g, check_battery=args.b, hr_handle=args.H, debug_gatttool=args.d, hr_show=args.r, verbose=args.v)
 
 
 if __name__ == "__main__":
